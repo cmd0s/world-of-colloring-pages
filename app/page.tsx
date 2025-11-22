@@ -1,7 +1,12 @@
 "use client"
 
-import { useState } from "react"
-import { Wand2, Download, Printer, Loader } from "lucide-react"
+import { useState, useEffect } from "react"
+import { Wand2, Share2, Loader } from "lucide-react"
+import { MiniKit, tokenToDecimals, Tokens, type PayCommandInput } from "@worldcoin/minikit-js"
+
+// TODO: Replace with your wallet address
+const PAYMENT_RECIPIENT = "0x1a8533cffaf3ef8125025eeaa517ee8d39a00554"
+const PAYMENT_AMOUNT = 0.1 // USD
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
@@ -13,6 +18,73 @@ export default function Page() {
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [error, setError] = useState("")
   const [progress, setProgress] = useState(0)
+  const [isWorldApp, setIsWorldApp] = useState(false)
+  const [processingPayment, setProcessingPayment] = useState(false)
+
+  useEffect(() => {
+    // Small delay to ensure MiniKit.install() has completed
+    const timer = setTimeout(() => {
+      setIsWorldApp(MiniKit.isInstalled())
+    }, 100)
+    return () => clearTimeout(timer)
+  }, [])
+
+  const handlePayment = async (): Promise<boolean> => {
+    if (!MiniKit.isInstalled()) {
+      return true // Skip payment if not in World App
+    }
+
+    setProcessingPayment(true)
+    setError("")
+
+    try {
+      // 1. Get payment reference from backend
+      const initRes = await fetch("/api/initiate-payment", { method: "POST" })
+      const { id } = await initRes.json()
+
+      // 2. Create payment payload
+      const payload: PayCommandInput = {
+        reference: id,
+        to: PAYMENT_RECIPIENT,
+        tokens: [
+          {
+            symbol: Tokens.USDC,
+            token_amount: tokenToDecimals(PAYMENT_AMOUNT, Tokens.USDC).toString(),
+          },
+        ],
+        description: "AI Coloring Page Generation",
+      }
+
+      // 3. Send payment command
+      const { finalPayload } = await MiniKit.commandsAsync.pay(payload)
+
+      if (finalPayload.status === "success") {
+        // 4. Confirm payment in backend
+        const confirmRes = await fetch("/api/confirm-payment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(finalPayload),
+        })
+        const { success } = await confirmRes.json()
+
+        if (success) {
+          return true
+        } else {
+          setError("Payment confirmation failed. Please try again.")
+          return false
+        }
+      } else {
+        setError("Payment was cancelled or failed.")
+        return false
+      }
+    } catch (err) {
+      console.error("[Payment] Error:", err)
+      setError(err instanceof Error ? err.message : "Payment failed. Please try again.")
+      return false
+    } finally {
+      setProcessingPayment(false)
+    }
+  }
 
   const handleGenerateRandomIdea = async () => {
     setGeneratingIdea(true)
@@ -60,6 +132,14 @@ export default function Page() {
     if (!idea.trim()) {
       setError("Please enter an idea for the coloring page!")
       return
+    }
+
+    // Process payment first if in World App
+    if (isWorldApp) {
+      const paymentSuccess = await handlePayment()
+      if (!paymentSuccess) {
+        return // Payment failed or cancelled
+      }
     }
 
     setError("")
@@ -111,6 +191,22 @@ export default function Page() {
     try {
       console.log("[v0] Download starting, image type:", generatedImage.substring(0, 50))
 
+      // In World App, use native share to save/share the image
+      if (isWorldApp && MiniKit.isInstalled()) {
+        const response = await fetch(generatedImage)
+        const blob = await response.blob()
+        const file = new File([blob], `coloring-page-${Date.now()}.png`, { type: "image/png" })
+
+        await MiniKit.commandsAsync.share({
+          files: [file],
+          title: "AI Coloring Page",
+          text: "Save or share your coloring page!",
+        })
+        console.log("[v0] Share dialog opened in World App")
+        return
+      }
+
+      // In browser, use standard download
       if (generatedImage.startsWith("data:image")) {
         const link = document.createElement("a")
         link.href = generatedImage
@@ -146,38 +242,17 @@ export default function Page() {
     }
   }
 
-  const handlePrint = () => {
-    if (!generatedImage) return
-
-    const printWindow = window.open("", "", "width=800,height=600")
-    if (printWindow) {
-      printWindow.document.write(`
-        <html>
-          <head>
-            <title>Coloring Page</title>
-            <style>
-              body { margin: 0; padding: 0; }
-              img { width: 100%; height: auto; display: block; }
-            </style>
-          </head>
-          <body>
-            <img src="${generatedImage}" alt="Coloring page" />
-            <script>
-              window.print();
-              window.close();
-            </script>
-          </body>
-        </html>
-      `)
-      printWindow.document.close()
-    }
-  }
-
   return (
     <main className="min-h-screen bg-gradient-to-br from-primary/10 via-background to-accent/10 p-4 md:p-8">
       <div className="max-w-2xl mx-auto">
         <div className="text-center mb-8 md:mb-12">
-          <h1 className="text-4xl md:text-5xl font-bold text-primary mb-3">AI Coloring Book</h1>
+          {isWorldApp && (
+            <div className="inline-flex items-center gap-2 bg-green-100 text-green-800 text-xs font-medium px-3 py-1 rounded-full mb-4">
+              <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+              Running in World App
+            </div>
+          )}
+          <h1 className="text-4xl md:text-5xl font-bold text-primary mb-3">AI Coloring Pages</h1>
           <p className="text-lg text-muted-foreground mb-6">
             Create unique coloring pages from your child's imagination
           </p>
@@ -235,10 +310,15 @@ export default function Page() {
 
               <Button
                 onClick={handleGenerate}
-                disabled={loading || !idea.trim()}
+                disabled={loading || processingPayment || !idea.trim()}
                 className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-6 text-base rounded-lg transition-all"
               >
-                {loading ? (
+                {processingPayment ? (
+                  <>
+                    <Loader className="mr-2 h-5 w-5 animate-spin" />
+                    Processing payment...
+                  </>
+                ) : loading ? (
                   <>
                     <Loader className="mr-2 h-5 w-5 animate-spin" />
                     Generating coloring page...
@@ -246,7 +326,7 @@ export default function Page() {
                 ) : (
                   <>
                     <Wand2 className="mr-2 h-5 w-5" />
-                    Generate Coloring Page
+                    {isWorldApp ? `Generate ($${PAYMENT_AMOUNT} USD)` : "Generate Coloring Page"}
                   </>
                 )}
               </Button>
@@ -283,22 +363,13 @@ export default function Page() {
                 </div>
               </div>
 
-              <div className="flex gap-3 flex-col md:flex-row">
-                <Button
-                  onClick={handlePrint}
-                  className="flex-1 bg-accent hover:bg-accent/90 text-accent-foreground font-semibold py-6 text-base rounded-lg transition-all"
-                >
-                  <Printer className="mr-2 h-5 w-5" />
-                  Print
-                </Button>
-                <Button
-                  onClick={handleDownload}
-                  className="flex-1 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-6 text-base rounded-lg transition-all"
-                >
-                  <Download className="mr-2 h-5 w-5" />
-                  Download as PNG
-                </Button>
-              </div>
+              <Button
+                onClick={handleDownload}
+                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-6 text-base rounded-lg transition-all"
+              >
+                <Share2 className="mr-2 h-5 w-5" />
+                Save / Share / Print
+              </Button>
             </div>
           </Card>
         )}
